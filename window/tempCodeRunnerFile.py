@@ -1,0 +1,2 @@
+
+        scroll.setFrameShape(QFrame.NoFrame)
