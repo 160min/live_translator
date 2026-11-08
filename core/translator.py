@@ -1,58 +1,85 @@
 import time
-from pptx import Presentation
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from abc import ABC, abstractmethod
+from queue import Queue, Empty
+from PySide6.QtCore import QThread, Signal
 
-def main():
-    # 1. PPT 파싱
-    print("1. PPT 파싱 중...")
-    prs = Presentation("sample.pptx")
-    extracted_texts = []
-    
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text") and shape.text.strip():
-                clean_text = " ".join(shape.text.split())
-                if clean_text not in extracted_texts:
-                    extracted_texts.append(clean_text)
-    
-    print(f"추출 완료! 총 항목 수: {len(extracted_texts)}개\n")
 
-    # 2. 번역 모델 로드
-    print("2. 번역 모델 로드 중...")
-    model_name = "Helsinki-NLP/opus-mt-ko-en"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+# 1. 번역 엔진 전략 추상화 (Strategy Pattern)
+class BaseTranslator(ABC):
+    @abstractmethod
+    def translate(self, text: str) -> str:
+        pass
 
-    # 웜업 (초기 연산 지연 방지)
-    _ = model.generate(**tokenizer("웜업", return_tensors="pt"))
 
-    # 3. 항목별 순차 번역 (상위 20개 테스트)
-    # 292개 전체를 번역하시려면 아래 [:20] 문구를 제거하세요.
-    target_list = extracted_texts[:20] 
-    
-    print(f"3. 상위 {len(target_list)}개 항목 번역 시작...\n")
-    print("=" * 60)
-    
-    start_time = time.perf_counter()
-    
-    for i, text in enumerate(target_list, 1):
-        inputs = tokenizer(text, return_tensors="pt", max_length=128, truncation=True)
-        outputs = model.generate(**inputs)
-        translated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+class HuggingFaceTranslator(BaseTranslator):
+    """오프라인 로컬 번역 (Helsinki-NLP/opus-mt-ko-en)"""
+    def __init__(self, model_name: str = "Helsinki-NLP/opus-mt-ko-en"):
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         
-        print(f"[{i:02d}] 원문: {text}")
-        print(f"     번역: {translated}")
-        print("-" * 60)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
         
-    end_time = time.perf_counter()
-    
-    total_time = end_time - start_time
-    avg_time = total_time / len(target_list)
-    
-    print("\n--- 번역 성능 검증 결과 ---")
-    print(f"번역한 항목 수: {len(target_list)}개")
-    print(f"전체 소요 시간: {total_time:.4f}초")
-    print(f"1개 문장당 평균 번역 속도: {avg_time:.4f}초")
+        # 웜업 (Cold Start 방지)
+        dummy = self.tokenizer("웜업", return_tensors="pt")
+        self.model.generate(**dummy)
 
-if __name__ == "__main__":
-    main()
+    def translate(self, text: str) -> str:
+        if not text.strip():
+            return ""
+        inputs = self.tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
+        outputs = self.model.generate(**inputs, max_new_tokens=512)
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+
+class GeminiTranslator(BaseTranslator):
+    """클라우드 API 번역 (google-genai)"""
+    def __init__(self, api_key: str):
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel("gemini-2.5-flash")
+
+    def translate(self, text: str) -> str:
+        if not text.strip():
+            return ""
+        prompt = f"Translate the following Korean text to natural English for lecture translation:\n{text}"
+        response = self.model.generate_content(prompt)
+        return response.text.strip()
+
+
+# 2. 비동기 번역 워커 스레드 (큐 감시 및 시그널 발행)
+class TranslationEngine(QThread):
+    translation_done = Signal(str, str, float)  # (원문, 번역문, 소요시간)
+    error_occurred = Signal(str)
+
+    def __init__(self, translator: BaseTranslator, request_queue: Queue):
+        super().__init__()
+        self.translator = translator
+        self.request_queue = request_queue
+        self.is_running = True
+
+    def set_translator(self, translator: BaseTranslator):
+        self.translator = translator
+
+    def run(self):
+        while self.is_running:
+            try:
+                text = self.request_queue.get(timeout=0.1)
+                if text is None:
+                    break
+
+                start_time = time.perf_counter()
+                translated_text = self.translator.translate(text)
+                elapsed_time = time.perf_counter() - start_time
+
+                self.translation_done.emit(text, translated_text, elapsed_time)
+                self.request_queue.task_done()
+
+            except Empty:
+                continue
+            except Exception as e:
+                self.error_occurred.emit(f"번역 처리 오류: {str(e)}")
+
+    def stop(self):
+        self.is_running = False
+        self.request_queue.put(None)
+        self.wait()
